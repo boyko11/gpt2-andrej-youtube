@@ -28,25 +28,33 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
+        # (B, T, n_embd) comes in
         B, T, C = x.shape # batch_size, block_size(sequence_length), embedding_dims(n_embd)
         # calculate queries, keys, values for all heads in batch and move head forward to be the batch
-        # nh - number of heads, hs - head_size, C - number of channels = nh * hs
-        # e.g. - GPT-2 (124M), nh=12, hs=64, nh*hs = 12*64=C=768 channels in the transformer
+        # n_heads - number of heads, head_size - head_size, C - number of channels = n_heads * head_size
+        # e.g. - GPT-2 (124M), n_heads=12, head_size=64, n_heads*head_size = 12*64=C=768 channels in the transformer
 
-        qkv = self.c_attn(x)
+        # (B, T, n_embd) comes in
+        qkv = self.c_attn(x) # (B, T, 3 * n_embd) comes out
         q, k, v = qkv.split(self.n_embd, dim=2)
 
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_heads, T, head_size)
+        k_transpose = k.transpose(-2, -1) # (B, n_heads, head_size, T)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_heads, T, head_size)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_heads, T, head_size)
 
         # attention materializes the large (T, T) matrix for all the queries and keys
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))
+        att = q @ k_transpose  # (B, n_heads, T, head_size) @ (B, n_heads, head_size, T) = (B, n_heads, T, T)
+        att = att / math.sqrt(k.size(-1)) # normalize as instructed by the paper
+        # att is (B, n_heads, T, T) at this point
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
 
-        y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) = (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side-by-side
+        y = att @ v # (B, n_heads, T, T) @ (B, n_heads, T, head_size) = (B, n_heads, T, head_size)
+        # y is (B, n_heads, T, head_size)
+        y_transpose = y.transpose(1, 2)
+        # y_transpose is (B, T, n_heads, head_size)
+        y = y_transpose.contiguous().view(B, T, C) # re-assemble all head outputs side-by-side
 
         y = self.c_proj(y)
         return y
@@ -77,6 +85,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
+        # (B, T, n_embd) comes in
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -87,7 +96,11 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
+
             wte = nn.Embedding(config.vocab_size, config.n_embd),
+            # (B, T) matrix of token indices go in (B, T, n_embd) matrix goes out
+            # look up the row for the index value stored at (b, t),
+            # return the row of n_embd columns as the embedding for this index(integer for the token)
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
             ln_f = nn.LayerNorm(config.n_embd),
@@ -95,9 +108,9 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     def forward(self, idx):
-        B, T = idx.shape
+        B, T = idx.shape # (5, 8) - 5 batches of 8 token indices
         assert T <= self.config.block_size, f"The context length must be <= {self.config.block_size}."
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T, ) [0, 1, ..., 6, 7]
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         x = tok_emb + pos_emb
@@ -179,7 +192,7 @@ import tiktoken
 enc = tiktoken.get_encoding('gpt2')
 text = "Hello, I'm a language model,"
 tokens = enc.encode(text)
-# print("Encoded tokens:", tokens)
+print("Encoded tokens:", tokens)
 tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
 print(tokens)
